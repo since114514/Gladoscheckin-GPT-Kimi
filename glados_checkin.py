@@ -365,14 +365,17 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
                 data = r.json()
                 msg = data.get("message", "")
                 code = data.get("code", -1)
+                msg_l = msg.lower()
 
                 if DEBUG:
                     logger.debug(f"签到响应: {data}")
 
-                if "Checkin! Got" in msg or code == 0:
+                if "checkin! got" in msg_l or code == 0:
                     status_msg = "签到成功"
                     logger.info("   ├─ ✅ 签到成功")
-                elif "Repeats" in msg or "Please Try Tomorrow" in msg:
+                elif ("repeats" in msg_l or "try tomorrow" in msg_l
+                      or "observation logged" in msg_l or "return tomorrow" in msg_l):
+                    # 改版后"今日已签到"的新旧两种消息格式都归到这里
                     status_msg = "重复签到"
                     logger.info("   ├─ 🔁 重复签到/今日已签到")
                 else:
