@@ -519,11 +519,23 @@ def format_results_table(results: List[Dict]) -> str:
 
     return "\n".join(lines)
 
+def push_status_word(results: List[Dict]) -> str:
+    """推送标题状态词：成功/重复/失败=全部账号处于该状态，警告=部分账号出错"""
+    success, repeat, fail = count_results(results)
+    total = len(results)
+    if fail == total:
+        return "失败"
+    if fail > 0:
+        return "警告"
+    if repeat == total:
+        return "重复"
+    return "成功"
+
 def format_push(results: List[Dict]) -> Tuple[str, str]:
     """格式化推送消息（手机端）"""
     success, repeat, fail = count_results(results)
 
-    title = f"GLaDOS 签到 | ✅{success} 🔁{repeat} ❌{fail}"
+    title = f"{push_status_word(results)} | GLaDOS 签到 ✅{success} 🔁{repeat} ❌{fail}"
 
     blocks = []
     for i, r in enumerate(results, 1):
