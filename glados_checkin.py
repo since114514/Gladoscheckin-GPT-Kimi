@@ -148,8 +148,9 @@ def retry(max_attempts=3, delay=2):
 def parse_cookies(raw: str) -> List[str]:
     """把 GLADOS_COOKIES 拆成多账号 cookie 列表。
 
-    支持 & 和换行两种分隔符；用 & 分隔且不含 koa:sess= 的片段视为
-    上一账号 cookie 值的一部分原样拼回（个别值里出现 & 时自动复原）。
+    支持 & 和换行两种分隔符；账号起始标记为 gld:sess= 或 koa:sess=，
+    两者都不含的片段视为上一账号 cookie 值的一部分原样拼回
+    （个别值里出现 & 时自动复原）。
     """
     tokens = re.split(r"([&\n])", raw)  # 分隔符保留在奇数位
     merged: List[str] = []
@@ -161,7 +162,7 @@ def parse_cookies(raw: str) -> List[str]:
         p = tok.strip()
         if not p:
             continue
-        if merged and pending_sep and "koa:sess=" not in p:
+        if merged and pending_sep and "gld:sess=" not in p and "koa:sess=" not in p:
             merged[-1] = merged[-1] + pending_sep + p
         else:
             merged.append(p)
