@@ -4,14 +4,11 @@ import os
 import logging
 import datetime
 import time
-
-# fdggasg
-# 烦啥施工方
-
+import re
 import sys
+import hashlib
 from typing import Dict, List, Optional, Tuple
 from functools import wraps
-from io import StringIO
 
 # ===================== 环境检测 =====================
 IS_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
@@ -23,15 +20,9 @@ def beijing_time_converter(timestamp):
     beijing_tz = datetime.timezone(datetime.timedelta(hours=8))
     return utc_dt.astimezone(beijing_tz).timetuple()
 
-# 配置日志：如果是 GitHub Actions，使用更简单的格式
-if IS_GITHUB_ACTIONS:
-    log_format = "%(asctime)s - %(levelname)s - %(message)s"
-else:
-    log_format = "%(asctime)s - %(levelname)s - %(message)s"
-
 logging.basicConfig(
     level=logging.DEBUG if RUNNER_DEBUG else logging.INFO,
-    format=log_format,
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
@@ -45,58 +36,51 @@ logger = logging.getLogger(__name__)
 # ===================== GitHub Actions 专用输出工具 =====================
 class ActionsLogger:
     """GitHub Actions 专用日志工具，支持分组、折叠、颜色"""
-    
+
     @staticmethod
     def group(title: str):
-        """开始折叠组"""
         if IS_GITHUB_ACTIONS:
             print(f"::group::{title}")
         else:
             print(f"\n{'='*50}\n{title}\n{'='*50}")
-    
+
     @staticmethod
     def endgroup():
-        """结束折叠组"""
         if IS_GITHUB_ACTIONS:
             print("::endgroup::")
         else:
             print("="*50)
-    
+
     @staticmethod
     def notice(message: str, title: str = ""):
-        """提示信息"""
         if IS_GITHUB_ACTIONS:
             title_param = f" title={title}" if title else ""
             print(f"::notice{title_param}::{message}")
         else:
             prefix = f"[{title}] " if title else ""
             print(f"ℹ️  {prefix}{message}")
-    
+
     @staticmethod
     def warning(message: str):
-        """警告信息（屏幕上显示为黄色）"""
         if IS_GITHUB_ACTIONS:
             print(f"::warning::{message}")
         else:
             print(f"⚠️  {message}")
-    
+
     @staticmethod
     def error(message: str):
-        """错误信息（屏幕上显示为红色）"""
         if IS_GITHUB_ACTIONS:
             print(f"::error::{message}")
         else:
             print(f"❌ {message}")
-    
+
     @staticmethod
     def debug(message: str):
-        """调试信息"""
         if IS_GITHUB_ACTIONS:
             print(f"::debug::{message}")
         else:
             print(f"🐛 {message}")
 
-# 实例化
 gha = ActionsLogger()
 
 # ===================== 环境变量 =====================
@@ -105,21 +89,32 @@ ENV_COOKIES = "GLADOS_COOKIES"
 ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
 ENV_DEBUG = "DEBUG"
 
-# ===================== API（修复 URL 空格） =====================
-CHECKIN_URL = "https://glados.cloud/api/user/checkin"
-STATUS_URL = "https://glados.cloud/api/user/status"
-POINTS_URL = "https://glados.cloud/api/user/points"
-EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
+# ===================== API（多域名轮换：GLaDOS 改版后会话可能与域名绑定） =====================
+DOMAINS = ["glados.cloud", "railgun.info"]
+
 PUSHPLUS_URL = "http://www.pushplus.plus/send"
 
-CHECKIN_DATA = {"token": "glados.cloud"}
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36"
 
-HEADERS_TEMPLATE = {
-    "referer": "https://glados.cloud/console/checkin",
-    "origin": "https://glados.cloud",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "content-type": "application/json;charset=UTF-8"
-}
+def checkin_url(domain: str) -> str:
+    return f"https://{domain}/api/user/checkin"
+
+def status_url(domain: str) -> str:
+    return f"https://{domain}/api/user/status"
+
+def points_url(domain: str) -> str:
+    return f"https://{domain}/api/user/points"
+
+def exchange_url(domain: str) -> str:
+    return f"https://{domain}/api/user/exchange"
+
+def api_headers(domain: str) -> Dict[str, str]:
+    return {
+        "referer": f"https://{domain}/console/checkin",
+        "origin": f"https://{domain}",
+        "user-agent": USER_AGENT,
+        "content-type": "application/json;charset=UTF-8"
+    }
 
 EXCHANGE_POINTS = {
     "plan100": 100,
@@ -150,10 +145,42 @@ def retry(max_attempts=3, delay=2):
         return wrapper
     return decorator
 
+def parse_cookies(raw: str) -> List[str]:
+    """把 GLADOS_COOKIES 拆成多账号 cookie 列表。
+
+    支持 & 和换行两种分隔符；用 & 分隔且不含 koa:sess= 的片段视为
+    上一账号 cookie 值的一部分原样拼回（个别值里出现 & 时自动复原）。
+    """
+    tokens = re.split(r"([&\n])", raw)  # 分隔符保留在奇数位
+    merged: List[str] = []
+    pending_sep = ""
+    for tok in tokens:
+        if tok in ("&", "\n"):
+            pending_sep = tok
+            continue
+        p = tok.strip()
+        if not p:
+            continue
+        if merged and pending_sep and "koa:sess=" not in p:
+            merged[-1] = merged[-1] + pending_sep + p
+        else:
+            merged.append(p)
+        pending_sep = ""
+    return merged
+
+def cookie_fingerprint(cookie: str) -> Dict:
+    """生成 cookie 的安全指纹（不含任何原始值，用于排查格式问题）"""
+    return {
+        "len": len(cookie),
+        "sess": "koa:sess=" in cookie,
+        "sig": "koa:sess.sig=" in cookie,
+        "sha": hashlib.sha256(cookie.encode("utf-8")).hexdigest()[:8]
+    }
+
 def load_config() -> Tuple[str, List[str], str]:
     """加载并验证配置，带详细日志"""
     gha.group("🚀 初始化配置")
-    
+
     try:
         token = os.environ.get(ENV_PUSHPLUS_TOKEN, "")
         cookies_raw = os.environ.get(ENV_COOKIES, "")
@@ -161,26 +188,28 @@ def load_config() -> Tuple[str, List[str], str]:
 
         gha.notice(f"运行环境: {'GitHub Actions' if IS_GITHUB_ACTIONS else '本地'}", "环境")
         gha.notice(f"Python 版本: {sys.version.split()[0]}", "环境")
-        
+
         if not cookies_raw:
             raise ValueError("❌ 未设置 GLADOS_COOKIES 环境变量")
-        
-        cookies = [c.strip() for c in cookies_raw.split("&") if c.strip()]
+
+        cookies = parse_cookies(cookies_raw)
         if not cookies:
             raise ValueError("❌ GLADOS_COOKIES 格式错误")
 
         logger.info(f"📋 配置信息:")
         logger.info(f"   - 账号数量: {len(cookies)} 个")
-        logger.info(f"   - 兑换计划: {plan} ({EXCHANGE_POINTS.get(plan, '未知')} 积分)")
+        logger.info(f"   - 域名列表: {', '.join(DOMAINS)}")
+        logger.info(f"   - 兑换计划: {plan} ({EXCHANGE_POINTS.get(plan, 500)} 积分)")
         logger.info(f"   - PushPlus: {'✅ 已启用' if token else '❌ 未启用'}")
-        
-        if DEBUG:
-            logger.info(f"   - 调试模式: 开启")
 
-        # 验证 Cookie
+        # 验证 Cookie 结构（只输出指纹，不输出内容）
         for i, cookie in enumerate(cookies, 1):
-            if "koa:sess" not in cookie:
-                gha.warning(f"账号 {i} 的 Cookie 可能不完整（缺少 koa:sess）")
+            fp = cookie_fingerprint(cookie)
+            logger.info(f"   - 账号{i} 指纹: 长度={fp['len']} koa:sess={'✓' if fp['sess'] else '✗'} "
+                        f"koa:sess.sig={'✓' if fp['sig'] else '✗'} sha={fp['sha']}")
+            if not fp["sess"] or not fp["sig"]:
+                gha.warning(f"账号 {i} 缺少 koa:sess 或 koa:sess.sig，"
+                            f"可能复制不完整，或 cookie 值里含 & 导致被误切分")
 
         return token, cookies, plan
     finally:
@@ -221,10 +250,22 @@ def make_request(
         logger.error(f"💥 请求异常: {e}")
         raise
 
-def get_points(cookie: str) -> int:
+def get_status_raw(cookie: str, domain: str) -> Tuple[bool, Dict]:
+    """查询账号状态。返回 (会话在该域名上是否有效, data 字段)"""
+    try:
+        r = make_request(status_url(domain), "GET", api_headers(domain), cookies=cookie)
+        if r:
+            data = r.json().get("data")
+            if isinstance(data, dict) and data:
+                return True, data
+    except Exception as e:
+        logger.error(f"查询状态异常: {e}")
+    return False, {}
+
+def get_points(cookie: str, headers: Dict[str, str], domain: str) -> int:
     """获取当前积分"""
     try:
-        r = make_request(POINTS_URL, "GET", HEADERS_TEMPLATE, cookies=cookie)
+        r = make_request(points_url(domain), "GET", headers, cookies=cookie)
         if r:
             points = int(float(r.json().get("points", 0)))
             if DEBUG:
@@ -248,7 +289,7 @@ def pushplus_send(token: str, title: str, content: str):
             "content": content,
             "template": "txt"
         }, timeout=10)
-        
+
         if r.ok and r.json().get("code") == 200:
             gha.notice("PushPlus 推送成功", "推送")
             logger.info("✅ PushPlus 推送成功")
@@ -262,15 +303,51 @@ def pushplus_send(token: str, title: str, content: str):
         gha.endgroup()
 
 # ===================== 核心逻辑（增强版） =====================
+COOKIE_INVALID_STATUS = "Cookie失效"
+
 def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
-    """处理单个账号，带详细日志"""
-    
+    """处理单个账号：先探测会话在哪个域名上有效，再在该域名完成签到/兑换"""
+
     gha.group(f"👤 处理账号 {account_idx}")
-    
+
     try:
-        # 1. 获取签到前积分
-        logger.info("📊 步骤 1/5: 查询当前积分...")
-        points_before = get_points(cookie)
+        # 1. 探测有效域名
+        logger.info("🌐 步骤 1/5: 探测会话有效域名...")
+        working_domain = None
+        status_data = {}
+        for domain in DOMAINS:
+            ok, data = get_status_raw(cookie, domain)
+            if ok:
+                working_domain = domain
+                status_data = data
+                logger.info(f"   ├─ ✅ 会话在 {domain} 上有效")
+                break
+            logger.info(f"   ├─ ⚠️ {domain} 返回未登录，尝试下一个域名...")
+
+        if not working_domain:
+            logger.error("   └─ ❌ 所有域名均未登录")
+            gha.warning(f"账号 {account_idx}: 所有域名都返回未登录，Cookie 已失效或格式不正确")
+            gha.notice(
+                "修复方法: 登录 GLaDOS 控制台 → F12 → Network → 刷新 → 点击第一个请求，"
+                "在 Request Headers 里复制 Cookie 中 koa:sess=...; koa:sess.sig=... 部分，"
+                "更新 GLADOS_COOKIES secret（多账号用 & 分隔）",
+                "Cookie 失效"
+            )
+            return {
+                "status": COOKIE_INVALID_STATUS,
+                "points": 0,
+                "days": COOKIE_INVALID_STATUS,
+                "total": "未知",
+                "exchange": "未兑换",
+                "before": 0,
+                "after": 0
+            }
+
+        headers = api_headers(working_domain)
+
+        # 2. 获取签到前积分
+        logger.info("📊 步骤 2/5: 查询当前积分...")
+        points_before = get_points(cookie, headers, working_domain)
         logger.info(f"   ├─ 当前积分: {points_before}")
 
         status_msg = "签到失败"
@@ -279,27 +356,25 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
         total = "未知"
         exchange_msg = "未兑换"
 
-        # 2. 执行签到
-        logger.info("📝 步骤 2/5: 执行签到...")
+        # 3. 执行签到
+        logger.info("📝 步骤 3/5: 执行签到...")
         try:
-            r = make_request(CHECKIN_URL, "POST", HEADERS_TEMPLATE, CHECKIN_DATA, cookie)
+            r = make_request(checkin_url(working_domain), "POST", headers,
+                             {"token": working_domain}, cookie)
             if r:
                 data = r.json()
                 msg = data.get("message", "")
                 code = data.get("code", -1)
-                
+
                 if DEBUG:
                     logger.debug(f"签到响应: {data}")
 
                 if "Checkin! Got" in msg or code == 0:
                     status_msg = "签到成功"
                     logger.info("   ├─ ✅ 签到成功")
-                elif "Repeats" in msg:
+                elif "Repeats" in msg or "Please Try Tomorrow" in msg:
                     status_msg = "重复签到"
-                    logger.info("   ├─ 🔁 重复签到")
-                elif "Please Try Tomorrow" in msg:
-                    status_msg = "今日已签到"
-                    logger.info("   ├─ 🔁 今日已签到")
+                    logger.info("   ├─ 🔁 重复签到/今日已签到")
                 else:
                     status_msg = f"异常: {msg[:30]}"
                     gha.warning(f"签到返回异常消息: {msg}")
@@ -310,28 +385,21 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
             status_msg = f"异常: {str(e)[:20]}"
             logger.error(f"   ├─ ❌ 签到异常: {e}")
 
-        # 3. 获取剩余天数
-        logger.info("📅 步骤 3/5: 查询剩余天数...")
+        # 4. 剩余天数 & 签到后积分
+        logger.info("📅 步骤 4/5: 查询剩余天数和最新积分...")
         try:
-            r = make_request(STATUS_URL, "GET", HEADERS_TEMPLATE, cookies=cookie)
-            if r:
-                days_val = r.json().get("data", {}).get("leftDays", 0)
-                days = f"{int(float(days_val))} 天"
-                logger.info(f"   ├─ 剩余天数: {days}")
-            else:
-                days = "获取失败"
-                logger.warning("   ├─ ⚠️ 获取剩余天数失败")
+            days_val = status_data.get("leftDays", 0)
+            days = f"{int(float(days_val))} 天"
+            logger.info(f"   ├─ 剩余天数: {days}")
         except Exception as e:
-            logger.error(f"   ├─ ❌ 查询天数异常: {e}")
+            logger.error(f"   ├─ ❌ 解析剩余天数异常: {e}")
             days = "获取失败"
 
-        # 4. 获取签到后积分
-        logger.info("💰 步骤 4/5: 更新积分信息...")
         try:
-            points_after = get_points(cookie)
+            points_after = get_points(cookie, headers, working_domain)
             gained = points_after - points_before
             total = f"{points_after} 积分"
-            
+
             if gained > 0:
                 logger.info(f"   ├─ 积分变化: {points_before} → {points_after} (+{gained})")
                 if status_msg == "签到成功":
@@ -345,16 +413,16 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
 
         # 5. 执行兑换
         logger.info("🔄 步骤 5/5: 检查兑换条件...")
-        need = EXCHANGE_POINTS[plan]
+        need = EXCHANGE_POINTS.get(plan, 500)
         exchange_success = False
-        
+
         if points_after >= need:
             logger.info(f"   ├─ 尝试兑换 {plan}（需 {need} 积分）...")
             try:
                 r = make_request(
-                    EXCHANGE_URL,
+                    exchange_url(working_domain),
                     "POST",
-                    HEADERS_TEMPLATE,
+                    headers,
                     {"planType": plan},
                     cookie
                 )
@@ -362,7 +430,7 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
                     resp_data = r.json()
                     if DEBUG:
                         logger.debug(f"兑换响应: {resp_data}")
-                        
+
                     if resp_data.get("code") == 0:
                         exchange_msg = f"✅ 兑换成功 {plan}"
                         exchange_success = True
@@ -385,7 +453,7 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
         # 6. 如果兑换成功，重新获取积分
         if exchange_success:
             try:
-                final_points = get_points(cookie)
+                final_points = get_points(cookie, headers, working_domain)
                 total = f"{final_points} 积分（已兑换 {need}）"
                 logger.info(f"   └─ 兑换后余额: {final_points} 积分")
             except:
@@ -411,6 +479,13 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
         gha.endgroup()
 
 # ===================== 格式化输出 =====================
+def count_results(results: List[Dict]) -> Tuple[int, int, int]:
+    """统计 成功/重复/失败 数量"""
+    success = sum(1 for r in results if "成功" in r['status'] and "重复" not in r['status'])
+    repeat = sum(1 for r in results if "重复" in r['status'] or "已签到" in r['status'])
+    fail = len(results) - success - repeat
+    return success, repeat, fail
+
 def format_results_table(results: List[Dict]) -> str:
     """生成 ASCII 表格形式的摘要"""
     lines = []
@@ -419,9 +494,9 @@ def format_results_table(results: List[Dict]) -> str:
     lines.append("="*80)
     lines.append(f"{'账号':<5} {'状态':<15} {'积分':<12} {'剩余天数':<10} {'兑换状态':<20}")
     lines.append("-"*80)
-    
+
     total_gained = 0
-    
+
     for i, r in enumerate(results, 1):
         status_short = r['status'].replace("签到成功", "成功").replace("重复签到", "重复")[:12]
         points_str = str(r['points']) if r['points'] != "未知" else "-"
@@ -430,26 +505,20 @@ def format_results_table(results: List[Dict]) -> str:
             points_str = f"+{r['points']}"
         days_short = r['days'].replace(" 天", "")
         exchange_short = r['exchange'][:18]
-        
+
         lines.append(f"{i:<5} {status_short:<15} {points_str:<12} {days_short:<10} {exchange_short:<20}")
-    
+
     lines.append("-"*80)
-    
-    # 统计信息
-    success = sum(1 for r in results if "成功" in r['status'] and "重复" not in r['status'])
-    repeat = sum(1 for r in results if "重复" in r['status'] or "已签到" in r['status'])
-    fail = len(results) - success - repeat
-    
+
+    success, repeat, fail = count_results(results)
     lines.append(f"统计: ✅成功 {success} 个 | 🔁重复 {repeat} 个 | ❌失败 {fail} 个 | 总获得积分: {total_gained}")
     lines.append("="*80)
-    
+
     return "\n".join(lines)
 
 def format_push(results: List[Dict]) -> Tuple[str, str]:
     """格式化推送消息（手机端）"""
-    success = sum(1 for r in results if "成功" in r['status'] and "重复" not in r['status'])
-    repeat = sum(1 for r in results if "重复" in r['status'] or "已签到" in r['status'])
-    fail = len(results) - success - repeat
+    success, repeat, fail = count_results(results)
 
     title = f"GLaDOS 签到 | ✅{success} 🔁{repeat} ❌{fail}"
 
@@ -459,7 +528,7 @@ def format_push(results: List[Dict]) -> Tuple[str, str]:
             icon = "✅"
         elif "重复" in r["status"] or "已签到" in r["status"]:
             icon = "🔁"
-        elif "失败" in r["status"]:
+        elif "失败" in r["status"] or COOKIE_INVALID_STATUS in r["status"]:
             icon = "❌"
         else:
             icon = "⚠️"
@@ -476,13 +545,13 @@ def format_push(results: List[Dict]) -> Tuple[str, str]:
 
     content = "\n\n".join(blocks)
     content += "\n\n⏰ 北京时间：" + datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    
+
     return title, content
 
 # ===================== main =====================
 def main():
     start_time = time.time()
-    
+
     try:
         token, cookies, plan = load_config()
         results = []
@@ -503,9 +572,9 @@ def main():
                     "before": 0,
                     "after": 0
                 })
-            # 账号间延迟
+            # 账号间延迟（避免触发站点频率限制）
             if i < len(cookies):
-                time.sleep(1)
+                time.sleep(3)
 
         # 生成表格摘要（在 Actions 日志中显示）
         table_summary = format_results_table(results)
@@ -513,7 +582,7 @@ def main():
 
         # 生成推送内容
         title, content = format_push(results)
-        
+
         # 推送详情
         gha.group("📱 推送内容预览")
         logger.info(f"推送标题: {title}")
@@ -526,12 +595,11 @@ def main():
         # 最终统计
         elapsed = time.time() - start_time
         gha.notice(f"所有任务完成，耗时 {elapsed:.2f} 秒", "完成")
-        
-        # 如果有失败，设置失败标记（可选）
-        fail_count = sum(1 for r in results if r['status'].startswith("异常") or "失败" in r['status'])
+
+        fail_count = count_results(results)[2]
         if fail_count > 0:
             gha.warning(f"有 {fail_count} 个账号处理失败")
-            
+
     except Exception as e:
         gha.error(f"程序运行失败: {e}")
         logger.exception("详细错误信息:")
