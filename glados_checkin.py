@@ -172,8 +172,8 @@ def cookie_fingerprint(cookie: str) -> Dict:
     """生成 cookie 的安全指纹（不含任何原始值，用于排查格式问题）"""
     return {
         "len": len(cookie),
+        "gld": "gld:sess=" in cookie,
         "sess": "koa:sess=" in cookie,
-        "sig": "koa:sess.sig=" in cookie,
         "sha": hashlib.sha256(cookie.encode("utf-8")).hexdigest()[:8]
     }
 
@@ -205,11 +205,10 @@ def load_config() -> Tuple[str, List[str], str]:
         # 验证 Cookie 结构（只输出指纹，不输出内容）
         for i, cookie in enumerate(cookies, 1):
             fp = cookie_fingerprint(cookie)
-            logger.info(f"   - 账号{i} 指纹: 长度={fp['len']} koa:sess={'✓' if fp['sess'] else '✗'} "
-                        f"koa:sess.sig={'✓' if fp['sig'] else '✗'} sha={fp['sha']}")
-            if not fp["sess"] or not fp["sig"]:
-                gha.warning(f"账号 {i} 缺少 koa:sess 或 koa:sess.sig，"
-                            f"可能复制不完整，或 cookie 值里含 & 导致被误切分")
+            logger.info(f"   - 账号{i} 指纹: 长度={fp['len']} gld:sess={'✓' if fp['gld'] else '✗'} "
+                        f"koa:sess={'✓' if fp['sess'] else '✗'} sha={fp['sha']}")
+            if not fp["gld"]:
+                gha.warning(f"账号 {i} 缺少 gld:sess（改版后的唯一身份凭证），该账号将无法通过认证")
 
         return token, cookies, plan
     finally:
@@ -326,11 +325,11 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
 
         if not working_domain:
             logger.error("   └─ ❌ 所有域名均未登录")
-            gha.warning(f"账号 {account_idx}: 所有域名都返回未登录，Cookie 已失效或格式不正确")
+            gha.warning(f"账号 {account_idx}: 所有域名都返回未登录，gld:sess token 已被服务器吊销或从未有效")
             gha.notice(
-                "修复方法: 登录 GLaDOS 控制台 → F12 → Network → 刷新 → 点击第一个请求，"
-                "在 Request Headers 里复制 Cookie 中 koa:sess=...; koa:sess.sig=... 部分，"
-                "更新 GLADOS_COOKIES secret（多账号用 & 分隔）",
+                "修复方法(2026-09-25 改版后认证只认 gld:sess): 为每个账号开一个独立的隐身窗口"
+                "登录 GLaDOS → F12 → Network → 刷新 → 复制第一个请求 Request Headers 里完整的 Cookie 值。"
+                "不要在同一个窗口里切换登录多个账号——新登录会吊销上一个账号的 gld:sess token!",
                 "Cookie 失效"
             )
             return {
