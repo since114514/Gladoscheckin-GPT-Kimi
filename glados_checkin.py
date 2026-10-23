@@ -122,6 +122,12 @@ EXCHANGE_POINTS = {
     "plan500": 500
 }
 
+# ===================== 紧急续期（剩余天数不足时降级兑换） =====================
+# 剩余天数低于 URGENT_DAYS_THRESHOLD、且积分不够配置档位时，
+# 降级用 URGENT_PLAN 兑换，避免积分没攒够 500 就直接断档
+URGENT_DAYS_THRESHOLD = 3
+URGENT_PLAN = "plan100"
+
 DEBUG = os.environ.get(ENV_DEBUG, "false").lower() == "true" or RUNNER_DEBUG
 
 # ===================== 工具函数 =====================
@@ -390,13 +396,20 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
 
         # 4. 剩余天数 & 签到后积分
         logger.info("📅 步骤 4/5: 查询剩余天数和最新积分...")
+        # 签到后重新查一次状态，拿到签到生效后的真实剩余天数（旧逻辑用签到前的值，会少 1 天）
+        ok_after, data_after = get_status_raw(cookie, working_domain)
+        if ok_after and data_after:
+            status_data = data_after
+        days_left: Optional[float] = None
         try:
             days_val = status_data.get("leftDays", 0)
-            days = f"{int(float(days_val))} 天"
+            days_left = float(days_val)
+            days = f"{int(days_left)} 天"
             logger.info(f"   ├─ 剩余天数: {days}")
         except Exception as e:
             logger.error(f"   ├─ ❌ 解析剩余天数异常: {e}")
             days = "获取失败"
+            days_left = None
 
         try:
             points_after = get_points(cookie, headers, working_domain)
@@ -414,19 +427,49 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
             total = "获取失败"
             points_after = points_before
 
-        # 5. 执行兑换
+        # 5. 执行兑换（积分够配置档位就直接兑；剩余天数告急则降级续期）
         logger.info("🔄 步骤 5/5: 检查兑换条件...")
         need = EXCHANGE_POINTS.get(plan, 500)
+        urgent_need = EXCHANGE_POINTS[URGENT_PLAN]
         exchange_success = False
+        exchange_need = need
+        used_plan: Optional[str] = None
 
         if points_after >= need:
+            used_plan = plan
             logger.info(f"   ├─ 尝试兑换 {plan}（需 {need} 积分）...")
+        elif days_left is not None and days_left < URGENT_DAYS_THRESHOLD:
+            if points_after >= urgent_need:
+                # 剩余天数告急、积分又没攒到配置档位 → 降级紧急续期
+                used_plan = URGENT_PLAN
+                exchange_need = urgent_need
+                gha.warning(
+                    f"账号 {account_idx}: 剩余 {int(days_left)} 天 < {URGENT_DAYS_THRESHOLD} 天"
+                    f"且积分 {points_after} < {need}，降级紧急兑换 {URGENT_PLAN}"
+                )
+                logger.info(
+                    f"   ├─ ⚠️ 剩余 {int(days_left)} 天 < {URGENT_DAYS_THRESHOLD} 天"
+                    f"且积分 {points_after} < {need}，降级兑换 {URGENT_PLAN}（需 {urgent_need} 积分）..."
+                )
+            else:
+                exchange_msg = f"❗ 剩余 {int(days_left)} 天，积分仅 {points_after}，不足 {urgent_need} 无法续期"
+                gha.error(
+                    f"账号 {account_idx}: 剩余 {int(days_left)} 天且积分不足 {urgent_need}，"
+                    f"无法续期，请尽快处理"
+                )
+                logger.error(f"   └─ ❗ {exchange_msg}")
+        else:
+            diff = need - points_after
+            exchange_msg = f"⏳ 积分不足（还需 {diff} 分）"
+            logger.info(f"   └─ ⏳ 积分不足，还需 {diff} 分")
+
+        if used_plan:
             try:
                 r = make_request(
                     exchange_url(working_domain),
                     "POST",
                     headers,
-                    {"planType": plan},
+                    {"planType": used_plan},
                     cookie
                 )
                 if r:
@@ -435,9 +478,10 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
                         logger.debug(f"兑换响应: {resp_data}")
 
                     if resp_data.get("code") == 0:
-                        exchange_msg = f"✅ 兑换成功 {plan}"
+                        tag = "（紧急续期）" if used_plan != plan else ""
+                        exchange_msg = f"✅ 兑换成功 {used_plan}{tag}"
                         exchange_success = True
-                        logger.info(f"   └─ ✅ 兑换成功 {plan}")
+                        logger.info(f"   └─ ✅ 兑换成功 {used_plan}{tag}")
                     else:
                         error_msg = resp_data.get("message", "未知错误")
                         exchange_msg = f"❌ 兑换失败: {error_msg[:30]}"
@@ -448,19 +492,24 @@ def checkin_and_process(cookie: str, plan: str, account_idx: int) -> Dict:
             except Exception as e:
                 exchange_msg = f"❌ 兑换异常: {str(e)[:20]}"
                 logger.error(f"   └─ ❌ 兑换异常: {e}")
-        else:
-            diff = need - points_after
-            exchange_msg = f"⏳ 积分不足（还需 {diff} 分）"
-            logger.info(f"   └─ ⏳ 积分不足，还需 {diff} 分")
 
-        # 6. 如果兑换成功，重新获取积分
+        # 6. 如果兑换成功，重新获取积分和剩余天数
         if exchange_success:
             try:
                 final_points = get_points(cookie, headers, working_domain)
-                total = f"{final_points} 积分（已兑换 {need}）"
+                total = f"{final_points} 积分（已兑换 {exchange_need}）"
                 logger.info(f"   └─ 兑换后余额: {final_points} 积分")
-            except:
+            except Exception:
                 pass
+
+            ok_final, data_final = get_status_raw(cookie, working_domain)
+            try:
+                if ok_final and data_final and data_final.get("leftDays") is not None:
+                    days_left = float(data_final["leftDays"])
+                    days = f"{int(days_left)} 天"
+                    logger.info(f"   └─ 兑换后剩余天数: {days}")
+            except Exception as e:
+                logger.error(f"   └─ ❌ 兑换后解析剩余天数异常: {e}")
 
         # 汇总输出（在组内显示）
         logger.info("📈 账号处理结果:")
