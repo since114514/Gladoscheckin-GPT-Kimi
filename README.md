@@ -1,101 +1,113 @@
- 
-# Glados自动签到,微信/邮箱/浏览器插件 推送结果
 
-## 重要声明：本帖源自--->本站项目[原贴链接](https://github.com/Devilstore/Gladoscheckin)，我仅就推送相关内容作了部分更改。
+# GLaDOS 自动签到（多账号 · 双站点 · 微信/邮箱/浏览器插件推送）
 
-## 注册一个GLaDOS的账号([注册地址](https://glados.space/landing/0A58E-NV28S-6U3QV-33VMG))
+基于 GitHub Actions 的 GLaDOS 自动签到，**代码底座取自 [Devilstore/Gladoscheckin](https://github.com/Devilstore/Gladoscheckin)（社区 486⭐ / 2583 fork，每日 CI 实测可用）**，本仓库在此之上保留 PushPlus 推送、增加「剩余天数告急降级续期」，并对失败诊断做了加强。
 
-## 原帖主的邀请码：([0A58E-NV28S-6U3QV-33VMG](https://0a58e-nv28s-6u3qv-33vmg.glados.space)) 来自原帖主@[Devilstore](https://github.com/Devilstore/Gladoscheckin/commits?author=Devilstore)
+## 注册一个 GLaDOS 账号（[注册地址](https://glados.space/landing/0A58E-NV28S-6U3QV-33VMG)）
 
-1. ###  **Fork**本仓库
+原帖主的邀请码：[`0A58E-NV28S-6U3QV-33VMG`](https://0a58e-nv28s-6u3qv-33vmg.glados.space)，来自 [@Devilstore](https://github.com/Devilstore/Gladoscheckin/commits?author=Devilstore)
+
+## 它解决了什么问题
+
+1. **一个账号可能只在一个站有效**：GLaDOS 已分裂出 `glados.cloud` 与 `railgun.info` 两套站点，迁移过的账号只认 railgun 的会话。
+   脚本对**每个 Cookie × 每个域名**都尝试签到，由返回码判定归属，你不需要知道账号迁到了哪个站。
+2. **服务端做设备绑定**：签到请求的 User-Agent 与会话浏览器不一致会返回 `code=4 / device-mismatch`。
+   脚本会读取服务端返回的 `loginDevice`，**自动切换对应平台的 UA 重试**，无需你手动配置 UA。
+3. **会话会被服务端吊销**：实测寿命 14~31 天，且**在浏览器重新登录会立刻吊销旧 token**。失效时日志与推送会明确提示 `code=-2`。
+
+## 使用方式
+
+### 1. Fork 本仓库
 
 ![1](imgs/1.png)
 
+### 2. 配置 Secrets
 
-2. ### 添加secret
+`Settings` → `Secrets and variables` → `Actions`：
 
- 跳转至                                                                                                                                                的仓库的`Settings`->`Secrets and variables`->`Action`
-添加1个`repository secret`，命名为`GLADOS_COOKIES`，其值对应GLaDOS账号的cookie值中的有效部分（获取方式如下）
+#### 2.1 `GLADOS_COOKIES`（必填）
 
-- 在GLaDOS的签到页面按`F12`
+**每个账号一个独立无痕窗口**（同一个窗口切换登录多个账号会互相吊销 gld:sess）：
 
-- 切换到`Network`页面下，刷新
+1. 无痕窗口登录 `glados.cloud`（若提示已迁移，改在 `railgun.info` 登录）
+2. `F12` → `Network` → 刷新 → 点第一个请求 → `Request Headers` → 复制**完整的 Cookie**
+3. 必须同时包含两份，缺 `.sig` 直接失效：
+
+   > `gld:sess=eyJ1c2...; gld:sess.sig=xJkO...`
+
+4. 多账号用 `&` 连接：`账号1的cookie&账号2的cookie&...`
 
 ![图片加载失败](imgs/2.png)
-
-- 点击第一个选项卡后在`Request Headers`下找到`Cookie`，右键复制cookie的值即可
-
-  > 参考格式：koa:sess=eyJ1c2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxAwMH0=; koa:sess.sig=xJkOxxxxxxxxxxxxxxxtnM;
-
 ![图片加载失败](imgs/3.png)
 
-- 多账号请在 `COOKIES` 中 添加多个 `cookies` 中间使用 `&`连接即可。（例如： `c1&c3&c3...`）
+> 老格式 `koa:sess=...` 已不被新接口接受（服务端直接回 `-2`），如果你还留着它，请按上面的新格式重取。
 
-- 配置积分兑换策略（非必须）
+#### 2.2 `GLADOS_EXCHANGE_PLAN`（可选，默认 `plan500`）
 
-- 添加1个`repository secret`，命名为`GLADOS_EXCHANGE_PLAN`，配置自动兑换积分策略：
+| 值 | 积分要求 | 兑换天数 |
+| --- | --- | --- |
+| `plan100` | 100 积分 | 10 天 |
+| `plan200` | 200 积分 | 30 天 |
+| `plan500` | 500 积分 | 100 天（默认） |
 
-| 值        | 积分要求 | 兑换天数      |
-| --------- | -------- | ------------- |
-| `plan100` | 100 积分 | 10 天         |
-| `plan200` | 200 积分 | 30 天         |
-| `plan500` | 500 积分 | 100 天 (默认) |
+#### 2.3 `PUSHPLUS_TOKEN`（可选）
 
-> 不配置时默认为 `plan500`，即积分达到 500 时自动兑换 100 天
+[pushplus](https://www.pushplus.plus/) 用户 token，支持微信服务号 / 邮箱 / 浏览器插件推送。未配置则只在 Actions 日志里输出结果。
 
-- **紧急续期（剩余天数不足时降级兑换）**
+> 也兼容 `PUSHDEER_SENDKEY`、`SERVERCHAN_SENDKEY`；配置了几个就同时发几个。
 
-  当某账号**剩余天数 < 3 天**、而积分**还没攒到配置的档位**（默认 500）时，脚本不再干等断档，
-  会自动降级用 `plan100` 兑换 10 天救急（`POST /api/user/exchange`，请求体 `{"planType":"plan100"}`），
-  成功后日志与推送里标记为 `✅ 兑换成功 plan100（紧急续期）`。
+#### 2.4 `GLADOS_VERBOSE`（可选）
 
-  决策优先级：
+设为 `true` 会输出每个请求的完整响应，排查时用。
 
-  | 条件 | 行为 |
-  | --- | --- |
-  | 积分 ≥ 配置档位（默认 500） | 按配置档位兑换（如 `plan500` 换 100 天） |
-  | 积分 < 配置档位 且 剩余 < 3 天 且 积分 ≥ 100 | 降级 `plan100` 紧急续期 |
-  | 积分 < 100 且 剩余 < 3 天 | 无法续期，日志 + 推送里 ❗ 提醒（Actions 里显示为 error） |
-  | 剩余 ≥ 3 天 | 不兑换，继续攒积分等配置档位 |
+### 3. 紧急续期（自动降级）
 
-  剩余天数取**签到后**重新查询的状态（不再用签到前的旧值）；兑换成功后会再刷一次积分和天数。
-  阈值可在 `glados_checkin.py` 顶部调整：`URGENT_DAYS_THRESHOLD = 3`、`URGENT_PLAN = "plan100"`。
+当某账号**剩余天数 < 3 天**、而积分**没攒到配置档位**时，不再干等断档，自动降级用 `plan100` 换 10 天救急：
 
-- **手机推送（自选）**
-  - 这里应用了[pushplus](https://www.pushplus.plus/) 来实现微信、邮箱或者浏览器插件推送，并且优化了结果UI，更美观。
-  - 方式：关注微信号pushplus，注册，实名，个人中心找到`用户token`
-  
-- 添加1个`repository secret`，命名为`PUSHPLUS_TOKEN`，其值对应`用户token`
+| 条件 | 行为 |
+| --- | --- |
+| 积分 ≥ 配置档位（默认 500） | 按配置档位兑换 |
+| 积分 < 档位 且 剩余 < 3 天 且 积分 ≥ 100 | 降级 `plan100` 紧急续期（推送里标注） |
+| 积分 < 100 且 剩余 < 3 天 | 不兑换，日志 + 推送里 `❗` 提醒 |
+| 剩余 ≥ 3 天 | 攒积分，不兑换 |
 
-  推送结果如下：
+阈值在 `checkin.py` 的 `Config.URGENT_DAYS_THRESHOLD` / `URGENT_PLAN` 调整。
 
-  1. 浏览器插件（在edge插件商店搜“pushplus”即可）结果如图：
+### 4. 定时
 
-  ##### ![](/imgs/3.1.png)
+`18 1,4 * * *`（UTC）= 北京时间 **09:18 / 12:18** 每天两次；也支持在 Actions 页面手动 `workflow_dispatch`。
+另外配了 keepalive 步骤，防止 60 天无提交被 GitHub 自动停用定时任务。
 
-  2. 微信消息结果如图：
+## 失败时怎么读日志
 
-  ![](/imgs/3.2.png)
-### **star**自己的仓库
+| 日志 | 含义 | 处理 |
+| --- | --- | --- |
+| `🔴 无权限(code=-2)` | 该 Cookie 在这个域名上不存在/已被吊销 | 重新登录该域名，重取 Cookie 更新 Secret |
+| `🔴 设备平台不匹配(code=4, loginDevice=…)` | UA 与会话浏览器平台不符，且自动重试仍失败 | 用同一浏览器登录后重取，或在 issue 反馈该平台名 |
+| `结果: 签到失败（No permission）` | railgun.info 侧的同类拒绝 | 同上 |
+| 全部账号都 -2 | Secret 过期（最常见） | 按 2.1 重取，注意每账号独立窗口 |
+| `❗ 剩余 N 天，积分不足 100 无法续期` | 积分见底、即将断档 | 充值/多攒积分或手动兑换 |
 
-![图片加载失败](imgs/4.png)
+**注意**：签到失败**不会**把 Actions 标记成红色（避免刷红），但会在运行摘要的 Annotations 里打 `::error::`，并推送里显示 `❌`。只有脚本自身崩溃才会 exit 1。
+
+## 文件结构
+
+```text
+checkin.py            # 签到主脚本（cookie × 域名矩阵 + 设备 UA 自适应 + 推送）
+logging_config.py     # 日志（北京时间、[I]/[W]/[E] 短标签）
+requirements.txt      # 依赖
+.github/workflows/glados.yml   # Actions 配置
+```
 
 ## 问题排查与定位
 
-- 大家可以通过查询 actions 中的 `GLaDOS Checkin`日志快速定位问题
+在 Actions 里打开 `glados/railgun checkin` 这次运行的日志，按上面的对照表读 `[E]` 开头的行即可。
 
-  ![](/imgs/3.3.png)
-
-------
+![图片加载失败](imgs/3.3.png)
 
 ![](/imgs/日志检查.png)
 
 ## 声明
 
-1. 本项目来自GitHub项目[原贴链接](https://github.com/Devilstore/Gladoscheckin)，与原作者不同的是，我用了pushplus来实现微信端、邮箱或者浏览器插件推送，用AI优化了一下页面，需要的可以fork使用一下。
-
-2. 本项目不保证稳定运行与更新, 因GitHub相关规定可能会删库, 请注意备份。
-
-
-
- 
+1. 本项目底座来自 [Devilstore/Gladoscheckin](https://github.com/Devilstore/Gladoscheckin)，原作者与本仓库均不保证稳定运行与更新，因 GitHub 相关规定可能会删库，请注意备份。
+2. Cookie 等于账号控制权，只应放进仓库 Secret，不要提交到代码里或贴给别人。

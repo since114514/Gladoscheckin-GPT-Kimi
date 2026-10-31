@@ -1,0 +1,5 @@
+# GLaDOS 自动签到依赖（PushPlus 走原生 requests，无需额外 SDK）
+requests
+# 可选推送后端：用到再装，未安装只会跳过对应后端
+# pypushdeer
+# serverchan-sdk
