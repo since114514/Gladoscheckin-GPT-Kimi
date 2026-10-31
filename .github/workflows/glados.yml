@@ -1,27 +1,60 @@
 name: GLaDOS Checkin
- 
+
 on:
-  schedule:
-    - cron: "27 2 * * *"   # 第一次：北京时间 10:27
   workflow_dispatch:
- 
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "imgs/**"
+  schedule:
+    # 北京时间 09:18 / 12:18（UTC 01:18 / 04:18），错开整点高峰
+    - cron: "18 1,4 * * *"
+
 jobs:
   checkin:
+    name: glados/railgun checkin
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: write
+
+    env:
+      # 强制第三方 actions 兼容 Node.js 24 运行环境
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
+          python-version: "3.13"
 
-      - name: Install deps
-        run: pip install requests
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run script
+      - name: Running checkin
+        run: python checkin.py
         env:
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          GLADOS_EXCHANGE_PLAN: plan500
-        run: python glados_checkin.py
+          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN || 'plan500' }}
+          GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+
+      # 防止 60 天无提交后 GitHub 自动停用定时任务
+      - name: Keep alive
+        uses: liskin/gh-workflow-keepalive@v1
+
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 7
+          delete_run_by_conclusion_pattern: success
