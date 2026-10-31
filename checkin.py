@@ -150,9 +150,22 @@ class Config:
         ExchangePlan.PLAN500.value: 500,
     }
 
-    """紧急续期：剩余天数低于阈值且积分不够配置档位时降级兑换"""
+    """紧急续期：剩余天数低于阈值时，按「贵的先试」逐级降级兑换"""
     URGENT_DAYS_THRESHOLD = 3
-    URGENT_PLAN = ExchangePlan.PLAN100.value
+    URGENT_CASCADE_PLANS = (ExchangePlan.PLAN200.value, ExchangePlan.PLAN100.value)
+
+    def urgent_candidates(self) -> List[Tuple[str, int]]:
+        """剩余天数告急时的降级候选，按所需积分从高到低。
+        只保留比配置档位更便宜的计划（配置档位本身由主逻辑处理）。"""
+        need = self.EXCHANGE_PLANS.get(self.exchange_plan)
+        candidates = [(plan, self.EXCHANGE_PLANS[plan]) for plan in self.URGENT_CASCADE_PLANS if plan in self.EXCHANGE_PLANS]
+        if need is not None:
+            candidates = [(plan, cost) for plan, cost in candidates if cost < need]
+        return sorted(candidates, key=lambda item: item[1], reverse=True)
+
+    def cheapest_plan_cost(self) -> int:
+        """最低可兑换门槛（用于提示还需多少分）"""
+        return min(self.EXCHANGE_PLANS.values())
 
     def __init__(self):
         self.pushplus_token: str = ""
@@ -202,9 +215,18 @@ class Config:
             f"Server酱 {'已设置' if self.serverchan_key else '未设置'}。"
         )
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
-        logger.info(
-            f"{LogEmoji.INFO} 紧急续期: 剩余 < {self.URGENT_DAYS_THRESHOLD} 天且积分不足档位时，降级 {self.URGENT_PLAN}。"
-        )
+        cascade = self.urgent_candidates()
+        if cascade:
+            chain = " → ".join(f"{plan}({cost}分)" for plan, cost in cascade)
+            logger.info(
+                f"{LogEmoji.INFO} 紧急续期: 剩余 < {self.URGENT_DAYS_THRESHOLD} 天且积分不够 "
+                f"{self.exchange_plan} 时，逐级降级 {chain}。"
+            )
+        else:
+            logger.info(
+                f"{LogEmoji.INFO} 紧急续期: 已是最低档位 {self.exchange_plan}，剩余 < "
+                f"{self.URGENT_DAYS_THRESHOLD} 天时仍不够则直接告警。"
+            )
 
         if verbose_env is not None:
             verbose_env_lower = verbose_env.lower()
@@ -727,50 +749,55 @@ class Checker:
         return result
 
     def _maybe_exchange(self, api: API, cookie: str, cookie_idx: int, domain: str, result: CheckinResult) -> str:
-        """兑换决策：够配置档位就换；剩余天数告急则降级 plan100 紧急续期"""
+        """兑换决策：
+        1. 积分够配置档位 → 按档位兑换
+        2. 剩余天数 < 阈值 → 按「贵的先试」逐级降级（plan200 → plan100）
+        3. 都不够 → 告警，等下次再攒
+        """
         plan = self.config.exchange_plan
         if plan not in self.config.EXCHANGE_PLANS:
             self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换")
             return "未配置兑换计划，跳过"
 
         need = self.config.EXCHANGE_PLANS[plan]
-        urgent_need = self.config.EXCHANGE_PLANS[self.config.URGENT_PLAN]
         target: Optional[str] = None
         urgent = False
 
         if result.points_num >= need:
             target = plan
             self._log(cookie_idx, domain, LogEmoji.EXCHANGE, f"积分够 {need}，开始兑换 {plan}", force=True)
-        elif (
-            result.days_num is not None
-            and result.days_num < self.config.URGENT_DAYS_THRESHOLD
-            and result.points_num >= urgent_need
-        ):
-            target = self.config.URGENT_PLAN
-            urgent = True
-            self._log(
-                cookie_idx,
-                domain,
-                LogEmoji.WARNING,
-                f"剩余 {result.days_num} 天 < {self.config.URGENT_DAYS_THRESHOLD} 天，"
-                f"积分 {result.points_num} 不够 {need}，降级紧急续期 {target}",
-                force=True,
-            )
         elif result.days_num is not None and result.days_num < self.config.URGENT_DAYS_THRESHOLD:
-            self._log(
-                cookie_idx,
-                domain,
-                LogEmoji.ERROR,
-                f"剩余 {result.days_num} 天且积分仅 {result.points_num}，不足 {urgent_need} 无法续期",
-                force=True,
-            )
-            return f"❗ 剩余 {result.days_num} 天，积分不足 {urgent_need} 无法续期"
+            # 剩余天数告急：从最贵的降级档位开始试，直到积分够得上
+            for candidate, cost in self.config.urgent_candidates():
+                if result.points_num >= cost:
+                    target, urgent = candidate, True
+                    self._log(
+                        cookie_idx,
+                        domain,
+                        LogEmoji.WARNING,
+                        f"剩余 {result.days_num} 天 < {self.config.URGENT_DAYS_THRESHOLD} 天，"
+                        f"积分 {result.points_num} 不够 {need}，降级紧急续期 {candidate}（需 {cost} 分）",
+                        force=True,
+                    )
+                    break
+
+            if target is None:
+                cheapest = self.config.cheapest_plan_cost()
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.ERROR,
+                    f"剩余 {result.days_num} 天且积分仅 {result.points_num}，"
+                    f"不足最低门槛 {cheapest} 无法续期，请尽快处理",
+                    force=True,
+                )
+                return f"❗ 剩余 {result.days_num} 天，积分不足 {cheapest} 无法续期"
         else:
             diff = need - result.points_num
             self._log(cookie_idx, domain, LogEmoji.INFO, f"积分不足，还需 {diff} 分")
             return f"待攒积分（还需 {diff} 分）"
 
-        exchange_msg = api.exchange(cookie, target, urgent_need if urgent else need)
+        exchange_msg = api.exchange(cookie, target, self.config.EXCHANGE_PLANS[target])
         if urgent and exchange_msg.startswith("兑换成功"):
             exchange_msg += "（紧急续期）"
 
